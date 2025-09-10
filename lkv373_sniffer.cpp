@@ -3,6 +3,9 @@
 // Default behavior: write raw MJPEG frames (multipart/x-mixed-replace) to stdout.
 // If --kvm-proxy-proto=1 is supplied, act as a TCP server (default 0.0.0.0:1347)
 // and serve frames using the same protocol as v4l2-stream-test.cpp (RAW RGB24 frames).
+// Additional: --kvm-proxy-proto-debug=1 prints detected MJPEG framerate and resolution,
+// and emits detailed KVM-Proxy protocol state messages to STDERR.
+
 #include <pcap.h>
 #include <arpa/inet.h>
 #include <net/ethernet.h>
@@ -234,8 +237,9 @@ static void BroadcastWakeups(const std::string& ifname, const std::string& sende
 // ---------------- Options ----------------
 struct Options {
     std::string iface = "eth0";
-    bool debug = false;
-    bool kvm_proxy_proto = false; // replaces mkv
+    bool debug = false;                 // packet debug
+    bool kvm_proxy_proto = false;       // replaces mkv
+    bool kvm_proxy_proto_debug = false; // KVM-Proxy protocol debug + print detected fps/res
     bool wakeups = true;
     std::string sender_mac = "000b78006001";
     std::string listen_addr = "0.0.0.0";
@@ -257,8 +261,10 @@ static Options parse_args(int argc, char** argv) {
         };
         if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
-                "Usage: %s [--interface=eth0] [--debug=0] [--kvm-proxy-proto=0] [--wakeups=1] [--sender-mac=000b78006001] [--listen-port=1347]\n"
-                "Default: MJPEG to stdout. If --kvm-proxy-proto=1, starts server on 0.0.0.0:PORT (RAW RGB24 frames via KVM-Proxy protocol).\n",
+                "Usage: %s [--interface=eth0] [--debug=0] [--kvm-proxy-proto=0] [--kvm-proxy-proto-debug=0]\n"
+                "          [--wakeups=1] [--sender-mac=000b78006001] [--listen-addr=0.0.0.0] [--listen-port=1347]\n"
+                "Default: MJPEG to stdout. If --kvm-proxy-proto=1, starts server on ADDR:PORT (RAW RGB24 frames via KVM-Proxy protocol).\n"
+                "If --kvm-proxy-proto-debug=1, prints detected MJPEG resolution and FPS, and detailed protocol logs.\n",
                 argv[0]);
             std::exit(0);
         }
@@ -266,6 +272,7 @@ static Options parse_args(int argc, char** argv) {
         if (!(v = getv("--interface")).empty()) o.iface = v;
         else if (!(v = getv("--debug")).empty()) o.debug = parse_bool(v);
         else if (!(v = getv("--kvm-proxy-proto")).empty()) o.kvm_proxy_proto = parse_bool(v);
+        else if (!(v = getv("--kvm-proxy-proto-debug")).empty()) o.kvm_proxy_proto_debug = parse_bool(v);
         else if (!(v = getv("--wakeups")).empty()) o.wakeups = parse_bool(v);
         else if (!(v = getv("--sender-mac")).empty()) o.sender_mac = v;
         else if (!(v = getv("--listen-port")).empty()) o.listen_port = std::atoi(v.c_str());
@@ -294,7 +301,7 @@ static int set_blocking(int fd) {
     if (fcntl(fd, F_SETFL, flags) < 0) return -1;
     return 0;
 }
-static bool send_all(int fd, const void* data, size_t len) {
+static bool send_all_dbg(int fd, const void* data, size_t len, bool dbg, const char* what) {
     const uint8_t* p = (const uint8_t*)data;
     size_t sent = 0;
     while (sent < len) {
@@ -302,11 +309,12 @@ static bool send_all(int fd, const void* data, size_t len) {
         if (n > 0) { sent += (size_t)n; continue; }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        if (dbg) std::fprintf(stderr, "[kvm-debug] send_all failed while sending %s to fd=%d: %s\n", what, fd, std::strerror(errno));
         return false;
     }
     return true;
 }
-static int setup_listen_socket(const std::string& addr, int port) {
+static int setup_listen_socket(const std::string& addr, int port, bool dbg) {
     signal(SIGPIPE, SIG_IGN);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("[kvm] socket"); return -1; }
@@ -327,6 +335,7 @@ static int setup_listen_socket(const std::string& addr, int port) {
     if (bind(fd, (sockaddr*)&sa, sizeof(sa)) < 0) { perror("[kvm] bind"); close(fd); return -1; }
     if (listen(fd, 16) < 0) { perror("[kvm] listen"); close(fd); return -1; }
     fprintf(stderr, "[kvm] Listening on %s:%d\n", addr.empty() ? "0.0.0.0" : addr.c_str(), port);
+    if (dbg) std::fprintf(stderr, "[kvm-debug] KVM-Proxy server initialized\n");
     return fd;
 }
 
@@ -399,7 +408,7 @@ struct DevState {
     std::string deviceName = "LKV373 Sniffer";
 };
 
-static void send_devinfo_packet(int fd, const DevState& s) {
+static bool send_devinfo_packet(int fd, const DevState& s, bool dbg) {
     using namespace netpkt;
     const uint16_t dev_index = 0;
     const uint8_t isTC358743 = 0;
@@ -433,10 +442,15 @@ static void send_devinfo_packet(int fd, const DevState& s) {
     if (!name.empty())
         std::memcpy(buf.data() + sizeof(Header) + sizeof(DevInfoMeta), name.data(), name.size());
 
-    (void)send_all(fd, buf.data(), buf.size());
+    bool ok = send_all_dbg(fd, buf.data(), buf.size(), dbg, "DEVINFO");
+    if (dbg) {
+        if (ok) std::fprintf(stderr, "[kvm-debug] Sent DEVINFO to fd=%d: %dx%d @ %d fps (RGB24)\n", fd, s.width, s.height, s.framerate);
+        else std::fprintf(stderr, "[kvm-debug] Failed to send DEVINFO to fd=%d\n", fd);
+    }
+    return ok;
 }
 
-static void send_signal_packet(int fd, uint8_t state) {
+static bool send_signal_packet(int fd, uint8_t state, bool dbg) {
     using namespace netpkt;
     SignalMeta sm{};
     sm.state = state;
@@ -450,10 +464,15 @@ static void send_signal_packet(int fd, uint8_t state) {
     uint8_t buf[sizeof(Header) + sizeof(SignalMeta)];
     std::memcpy(buf, &hdr, sizeof(hdr));
     std::memcpy(buf + sizeof(hdr), &sm, sizeof(sm));
-    (void)send_all(fd, buf, sizeof(buf));
+    bool ok = send_all_dbg(fd, buf, sizeof(buf), dbg, "SIGNAL");
+    if (dbg) {
+        std::fprintf(stderr, "[kvm-debug] Sent SIGNAL=%s to fd=%d (%s)\n",
+                     state == netpkt::SIGNAL_UP ? "UP" : "DOWN", fd, ok ? "ok" : "fail");
+    }
+    return ok;
 }
 
-static bool send_frame_packet_raw(int fd, const RGBFrame& f, uint64_t frame_id, uint64_t ts_us) {
+static bool send_frame_packet_raw(int fd, const RGBFrame& f, uint64_t frame_id, uint64_t ts_us, bool dbg) {
     using namespace netpkt;
     FrameMeta fm{};
     fm.frame_id = htonll(frame_id);
@@ -472,11 +491,9 @@ static bool send_frame_packet_raw(int fd, const RGBFrame& f, uint64_t frame_id, 
     hdr.headerSize = htonl((uint32_t)(sizeof(Header) + sizeof(FrameMeta)));
     hdr.payloadSize = htonll((uint64_t)f.rgb.size());
 
-    // send header + meta
-    if (!send_all(fd, &hdr, sizeof(hdr))) return false;
-    if (!send_all(fd, &fm, sizeof(fm))) return false;
-    // send payload
-    if (!send_all(fd, f.rgb.data(), f.rgb.size())) return false;
+    if (!send_all_dbg(fd, &hdr, sizeof(hdr), dbg, "FRAME.header")) return false;
+    if (!send_all_dbg(fd, &fm, sizeof(fm), dbg, "FRAME.meta")) return false;
+    if (!send_all_dbg(fd, f.rgb.data(), f.rgb.size(), dbg, "FRAME.payload")) return false;
     return true;
 }
 
@@ -527,10 +544,14 @@ int main(int argc, char** argv) {
     auto mono_start = std::chrono::steady_clock::now();
 
     if (opt.kvm_proxy_proto) {
-        listen_fd = setup_listen_socket(opt.listen_addr, opt.listen_port);
+        listen_fd = setup_listen_socket(opt.listen_addr, opt.listen_port, opt.kvm_proxy_proto_debug);
         if (listen_fd < 0) {
             pcap_close(handle);
             return 1;
+        }
+        if (opt.kvm_proxy_proto_debug) {
+            std::fprintf(stderr, "[kvm-debug] KVM-Proxy protocol mode enabled on %s:%d\n",
+                         opt.listen_addr.c_str(), opt.listen_port);
         }
     }
 
@@ -553,11 +574,16 @@ int main(int argc, char** argv) {
             clients.push_back(c);
             char ip[64]; inet_ntop(AF_INET, &cliaddr.sin_addr, ip, sizeof(ip));
             fprintf(stderr, "[kvm] client %s:%d connected (fd=%d), total=%zu\n", ip, ntohs(cliaddr.sin_port), cfd, clients.size());
+            if (opt.kvm_proxy_proto_debug) {
+                std::fprintf(stderr, "[kvm-debug] New client fd=%d awaiting DEVINFO/SIGNAL\n", cfd);
+            }
             // If we already have devinfo, send now
             if (devinfo_set) {
-                send_devinfo_packet(cfd, dev);
-                send_signal_packet(cfd, netpkt::SIGNAL_UP);
-                for (auto& cc : clients) { if (cc.fd == cfd) { cc.initialized = true; break; } }
+                if (send_devinfo_packet(cfd, dev, opt.kvm_proxy_proto_debug)) {
+                    send_signal_packet(cfd, netpkt::SIGNAL_UP, opt.kvm_proxy_proto_debug);
+                    std::fprintf(stderr, "[kvm-debug] Sent DEVINFO/SIGNAL packet to client fd=%d\n", cfd);
+                    for (auto& cc : clients) { if (cc.fd == cfd) { cc.initialized = true; break; } }
+                }
             }
         }
     };
@@ -570,12 +596,21 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < clients.size();) {
             Client& c = clients[i];
             if (!c.initialized) {
-                send_devinfo_packet(c.fd, dev);
-                send_signal_packet(c.fd, netpkt::SIGNAL_UP);
+                if (!send_devinfo_packet(c.fd, dev, opt.kvm_proxy_proto_debug) ||
+                    !send_signal_packet(c.fd, netpkt::SIGNAL_UP, opt.kvm_proxy_proto_debug)) {
+                    if (opt.kvm_proxy_proto_debug) std::fprintf(stderr, "[kvm-debug] init failed, drop fd=%d\n", c.fd);
+                    close(c.fd);
+                    clients.erase(clients.begin() + i);
+                    continue;
+                }
                 c.initialized = true;
             }
-            if (!send_frame_packet_raw(c.fd, rgb, id, ts_us)) {
-                fprintf(stderr, "[kvm] drop client fd=%d\n", c.fd);
+            if (opt.kvm_proxy_proto_debug) {
+                std::fprintf(stderr, "[kvm-debug] Sending FRAME id=%" PRIu64 " %dx%d bytes=%zu to fd=%d\n",
+                             id, rgb.width, rgb.height, rgb.rgb.size(), c.fd);
+            }
+            if (!send_frame_packet_raw(c.fd, rgb, id, ts_us, opt.kvm_proxy_proto_debug)) {
+                fprintf(stderr, "[kvm] drop client fd=%d (send error: %s)\n", c.fd, std::strerror(errno));
                 close(c.fd);
                 clients.erase(clients.begin() + i);
                 continue;
@@ -589,6 +624,14 @@ int main(int argc, char** argv) {
     int totalframes = 0;
     Frame CurrentPacket;
     CurrentPacket.Data.clear();
+
+    // MJPEG FPS estimation
+    bool have_last_time = false;
+    auto last_frame_tp = std::chrono::steady_clock::now();
+    double fps_est = 0.0;
+    double ema_alpha = 0.2;
+    size_t fps_samples = 0;
+    auto last_fps_print = std::chrono::steady_clock::now();
 
     // Ports
     const int UDP_DPORT_OFFSET = 36; // Ethernet(14)+IPv4(20)=34; UDP dest port at +2 -> 36..37
@@ -675,8 +718,24 @@ int main(int argc, char** argv) {
 
         // End of frame detection: high bit set?
         if (static_cast<uint16_t>(~(CurrentChunk >> 15)) == 65534) {
-            // We have a complete JPEG frame in CurrentPacket.Data
+            // Completed JPEG frame in CurrentPacket.Data
             totalframes++;
+
+            // FPS estimation
+            auto now = std::chrono::steady_clock::now();
+            if (have_last_time) {
+                double dt = std::chrono::duration<double>(now - last_frame_tp).count();
+                if (dt > 0.001 && dt < 1.0) {
+                    double inst = 1.0 / dt;
+                    if (fps_samples == 0) fps_est = inst;
+                    else fps_est = ema_alpha * inst + (1.0 - ema_alpha) * fps_est;
+                    fps_samples++;
+                }
+            } else {
+                have_last_time = true;
+            }
+            last_frame_tp = now;
+
             if (!opt.kvm_proxy_proto) {
                 const char* boundary = "\n--myboundary\nContent-Type: image/jpeg\n\n";
                 std::vector<uint8_t> fin;
@@ -691,35 +750,57 @@ int main(int argc, char** argv) {
                     if (jpeg_get_dims(CurrentPacket.Data.data(), CurrentPacket.Data.size(), w, h)) {
                         dev.width = w;
                         dev.height = h;
-                        dev.framerate = 25;     // unknown; assume 25
-                        dev.targetFps = 25.0;
+                        // If we have at least a few fps samples, use that; otherwise default to 25
+                        int fps_i = (fps_samples >= 3) ? (int)(fps_est + 0.5) : 25;
+                        if (fps_i <= 0) fps_i = 25;
+                        dev.framerate = fps_i;
+                        dev.targetFps = (double)fps_i;
                         dev.frameDelayMicros = 1000000.0 / dev.targetFps;
                         devinfo_set = true;
+                        if (opt.kvm_proxy_proto_debug) {
+                            std::fprintf(stderr, "[kvm-debug] Detected MJPEG stream: %dx%d @ ~%.2f fps (initial)\n",
+                                         dev.width, dev.height, (fps_samples ? fps_est : (double)dev.framerate));
+                        }
                         // initialize existing clients
                         for (auto& c : clients) {
-                            send_devinfo_packet(c.fd, dev);
-                            send_signal_packet(c.fd, netpkt::SIGNAL_UP);
-                            c.initialized = true;
+                            if (send_devinfo_packet(c.fd, dev, opt.kvm_proxy_proto_debug)) {
+                                send_signal_packet(c.fd, netpkt::SIGNAL_UP, opt.kvm_proxy_proto_debug);
+                                c.initialized = true;
+                            }
+                        }
+                    }
+                } else {
+                    // Periodic debug print with current estimate
+                    if (opt.kvm_proxy_proto_debug) {
+                        auto since = std::chrono::duration<double>(now - last_fps_print).count();
+                        if (since >= 2.0 && fps_samples > 0) {
+                            std::fprintf(stderr, "[kvm-debug] MJPEG stream ongoing: %dx%d @ ~%.2f fps (clients=%zu)\n",
+                                         dev.width, dev.height, fps_est, clients.size());
+                            last_fps_print = now;
                         }
                     }
                 }
+
                 if (!clients.empty() && devinfo_set) {
                     RGBFrame rgb;
                     if (jpeg_decode_to_rgb(CurrentPacket.Data.data(), CurrentPacket.Data.size(), rgb)) {
                         // sanity: dimensions stable?
                         if (rgb.width != dev.width || rgb.height != dev.height) {
-                            // If dimensions change, update dev and resend devinfo to clients.
+                            if (opt.kvm_proxy_proto_debug) {
+                                std::fprintf(stderr, "[kvm-debug] Resolution change detected: %dx%d -> %dx%d, resending DEVINFO\n",
+                                             dev.width, dev.height, rgb.width, rgb.height);
+                            }
                             dev.width = rgb.width;
                             dev.height = rgb.height;
                             for (auto& c : clients) {
-                                send_devinfo_packet(c.fd, dev);
-                                send_signal_packet(c.fd, netpkt::SIGNAL_UP);
+                                send_devinfo_packet(c.fd, dev, opt.kvm_proxy_proto_debug);
+                                send_signal_packet(c.fd, netpkt::SIGNAL_UP, opt.kvm_proxy_proto_debug);
                                 c.initialized = true;
                             }
                         }
                         broadcast_raw_frame(rgb);
                     } else {
-                        if (opt.debug) std::fprintf(stderr, "[kvm] JPEG decode failed\n");
+                        if (opt.kvm_proxy_proto_debug) std::fprintf(stderr, "[kvm-debug] JPEG decode failed (%zu bytes)\n", CurrentPacket.Data.size());
                     }
                 }
             }
