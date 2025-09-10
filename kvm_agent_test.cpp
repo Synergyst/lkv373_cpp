@@ -224,8 +224,7 @@ static void run_video_server(VideoServerConfig cfg) {
         std::cerr << "[video] failed to listen on " << cfg.bind_ip << ":" << cfg.port << "\n";
         return;
     }
-    std::cout << "[video] listening on " << cfg.bind_ip << ":" << cfg.port
-              << " (" << cfg.width << "x" << cfg.height << " @ " << cfg.fps << "fps, q=" << cfg.quality << ")\n";
+    fprintf(stderr, "[video] listening on %s:%d (%dx%d @ %d FPS, q=%d)\n", cfg.bind_ip.c_str(), cfg.port, cfg.width, cfg.height, cfg.fps, cfg.quality);
     while (!g_shutdown.load()) {
         sockaddr_in cli{};
         socklen_t slen = sizeof(cli);
@@ -245,7 +244,6 @@ static void run_video_server(VideoServerConfig cfg) {
 }
 
 // Control server
-
 struct ControlServerConfig {
     std::string bind_ip{"127.0.0.1"};
     int port{1444};
@@ -407,8 +405,7 @@ static void run_control_server(ControlServerConfig cfg) {
         std::cerr << "[ctrl] failed to listen on " << cfg.bind_ip << ":" << cfg.port << "\n";
         return;
     }
-    std::cout << "[ctrl] listening on " << cfg.bind_ip << ":" << cfg.port
-              << " (remoteSize=" << cfg.remote_w << "x" << cfg.remote_h << ")\n";
+    fprintf(stderr, "[ctrl] listening on %s:%d (%dx%d)\n", cfg.bind_ip.c_str(), cfg.port, cfg.remote_w, cfg.remote_h);
 
     while (!g_shutdown.load()) {
         sockaddr_in cli{};
